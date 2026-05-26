@@ -1,109 +1,125 @@
-# PromptIR: Prompting for All-in-One Blind Image Restoration (NeurIPS'23)
+# HW4 版：環境重建、訓練、評估
 
-[Vaishnav Potlapalli](https://www.vaishnavrao.com/), [Syed Waqas Zamir](https://scholar.google.ae/citations?hl=en&user=POoai-QAAAAJ), [Salman Khan](https://salman-h-khan.github.io/) and [Fahad Shahbaz Khan](https://scholar.google.es/citations?user=zvaeYnUAAAAJ&hl=en)
+本文件提供從零開始重建環境，到啟動訓練與產生 `pred.npz` 的完整流程。
 
-[![paper](https://img.shields.io/badge/arXiv-Paper-<COLOR>.svg)](https://arxiv.org/abs/2306.13090)
+## 1) 建立乾淨環境
 
-
-<hr />
-
-> **Abstract:** *Image restoration involves recovering a high-quality clean image from its degraded
-version. Deep learning-based methods have significantly improved image restora-
-tion performance, however, they have limited generalization ability to different
-degradation types and levels. This restricts their real-world application since it
-requires training individual models for each specific degradation and knowing the
-input degradation type to apply the relevant model. We present a prompt-based
-learning approach, PromptIR, for All-In-One image restoration that can effectively
-restore images from various types and levels of degradation. In particular, our
-method uses prompts to encode degradation-specific information, which is then
-used to dynamically guide the restoration network. This allows our method to
-generalize to different degradation types and levels, while still achieving state-of-
-the-art results on image denoising, deraining, and dehazing. Overall, PromptIR
-offers a generic and efficient plugin module with few lightweight prompts that can
-be used to restore images of various types and levels of degradation with no prior
-information of corruptions.* 
-<hr />
-
-## Network Architecture
-
-<img src = "mainfig.png"> 
-
-## Installation and Data Preparation
-
-See [INSTALL.md](INSTALL.md) for the installation of dependencies and dataset preperation required to run this codebase.
-
-## Training
-
-After preparing the training data in ```data/``` directory, use 
-```
-python train.py
-```
-to start the training of the model. Use the ```de_type``` argument to choose the combination of degradation types to train on. By default it is set to all the 3 degradation types (noise, rain, and haze).
-
-Example Usage: If we only want to train on deraining and dehazing:
-```
-python train.py --de_type derain dehaze
+```bash
+conda env create -f env_hw4.yml
+conda activate promptir-hw4
 ```
 
-## Testing
+驗證 CUDA 與 PyTorch：
 
-After preparing the testing data in ```test/``` directory, place the mode checkpoint file in the ```ckpt``` directory. The pretrained model can be downloaded [here](https://drive.google.com/file/d/1j-b5Od70pGF7oaCqKAfUzmf-N-xEAjYl/view?usp=sharingg), alternatively, it is also available under the releases tab. To perform the evalaution use
-```
-python test.py --mode {n}
-```
-```n``` is a number that can be used to set the tasks to be evaluated on, 0 for denoising, 1 for deraining, 2 for dehaazing and 3 for all-in-one setting.
-
-Example Usage: To test on all the degradation types at once, run:
-
-```
-python test.py --mode 3
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-## Demo
-To obtain visual results from the model ```demo.py``` can be used. After placing the saved model file in ```ckpt``` directory, run:
+## 2) 確認資料集目錄
+
+預設使用下列路徑：
+
+```text
+data/release_folder/hw4_realse_dataset/
+  train/
+    clean/
+    degraded/
+  test/
+    degraded/
 ```
-python demo.py --test_path {path_to_degraded_images} --output_path {save_images_here}
+
+如果你的資料放在其他地方，訓練與評估時用 `--data_root` 指定。
+
+## 3) 從零開始訓練（不使用預訓練權重）
+
+`train_hw4.py` 預設就是 from scratch，不會載入任何預訓練模型。
+
+```bash
+python train_hw4.py \
+  --data_root data/release_folder/hw4_realse_dataset \
+  --save_dir ckpt/hw4 \
+  --epochs 200 \
+  --batch_size 8 \
+  --patch_size 128 \
+  --num_workers 8 \
+  --amp
 ```
-Example usage to run inference on a directory of images:
+
+訓練後會產生：
+
+- `ckpt/hw4/best.pth`：驗證 PSNR 最佳模型
+- `ckpt/hw4/last.pth`：最後一個 epoch 模型
+
+## 4) 產生提交檔 pred.npz
+
+```bash
+python eval_hw4.py \
+  --data_root data/release_folder/hw4_realse_dataset \
+  --ckpt ckpt/hw4/best.pth \
+  --output_npz data/release_folder/pred.npz
 ```
-python demo.py --test_path './test/demo/' --output_path './output/demo/'
+
+`pred.npz` 內容格式：
+
+- key: 測試影像檔名（例如 `0.png`）
+- value: `uint8`、shape=`(3, H, W)` 的 numpy array
+
+這個格式與 `data/release_folder/pred.npz` 範例一致。
+
+## 5) 可選：同時輸出還原 PNG
+
+```bash
+python eval_hw4.py \
+  --data_root data/release_folder/hw4_realse_dataset \
+  --ckpt ckpt/hw4/best.pth \
+  --output_npz data/release_folder/pred.npz \
+  --save_png_dir output/hw4_test_png
 ```
-Example usage to run inference on an image directly:
+
+
+## 6)
+
+```bash
+cd /home/cvml_7/Desktop/2026_class/PromptIR
+
+# 1) 接續訓練到 200 epochs（沿用你目前較穩定設定）
+conda run -n promptir-hw4 python train_hw4.py \
+  --data_root data/release_folder/hw4_realse_dataset \
+  --save_dir ckpt/hw4 \
+  --epochs 200 \
+  --batch_size 2 \
+  --patch_size 64 \
+  --num_workers 4 \
+  --amp \
+  --resume ckpt/hw4/last.pth | tee -a train_hw4.log
+
+# 2) 訓練完成後產生提交檔 pred.npz
+conda run -n promptir-hw4 python eval_hw4.py \
+  --data_root data/release_folder/hw4_realse_dataset \
+  --ckpt ckpt/hw4/best.pth \
+  --output_npz data/release_folder/pred.npz
+
+# 3) 檢查 pred.npz 格式
+conda run -n promptir-hw4 python -c "import numpy as np; p=np.load('data/release_folder/pred.npz'); k=sorted(p.files); print('num=',len(k),'first=',k[:5],'shape=',p[k[0]].shape,'dtype=',p[k[0]].dtype)"
 ```
-python demo.py --test_path './test/demo/image.png' --output_path './output/demo/'
+
+如果你要背景跑訓練（關掉終端也繼續）就用：
+
+```bash
+cd /home/cvml_7/Desktop/2026_class/PromptIR
+nohup conda run -n promptir-hw4 python train_hw4.py \
+  --data_root data/release_folder/hw4_realse_dataset \
+  --save_dir ckpt/hw4 \
+  --epochs 200 \
+  --batch_size 2 \
+  --patch_size 64 \
+  --num_workers 4 \
+  --amp \
+  --resume ckpt/hw4/last.pth > train_hw4.log 2>&1 &
 ```
-To use tiling option while running ```demo.py``` set ```--tile``` option to ```True```. The Tile size and Tile overlap parameters can be adjusted using ```--tile_size``` and ```--tile_overlap``` options respectively.
 
+查看進度：
 
-
-
-## Results
-Performance results of the PromptIR framework trained under the all-in-one setting
-
-<summary><strong>Table</strong> </summary>
-
-<img src = "prompt-ir-results.png"> 
-
-<summary><strong>Visual Results</strong></summary>
-
-The visual results of the PromptIR model evaluated under the all-in-one setting can be downloaded [here](https://drive.google.com/drive/folders/1Sm-mCL-i4OKZN7lKuCUrlMP1msYx3F6t?usp=sharing)
-
-
-
-## Citation
-If you use our work, please consider citing:
-
-    @inproceedings{potlapalli2023promptir,
-      title={PromptIR: Prompting for All-in-One Image Restoration},
-      author={Potlapalli, Vaishnav and Zamir, Syed Waqas and Khan, Salman and Khan, Fahad},
-      booktitle={Thirty-seventh Conference on Neural Information Processing Systems},
-      year={2023}
-    }
-
-
-## Contact
-Should you have any questions, please contact pvaishnav2718@gmail.com
-
-
-**Acknowledgment:** This code is based on the [AirNet](https://github.com/XLearning-SCU/2022-CVPR-AirNet) and [Restormer](https://github.com/swz30/Restormer) repositories. 
-
+```bash
+tail -f train_hw4.log
+```
