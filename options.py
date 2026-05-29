@@ -14,6 +14,15 @@ parser.add_argument('--de_type', nargs='+', default=['denoise_15', 'denoise_25',
 
 parser.add_argument('--patch_size', type=int, default=128, help='patchsize of input.')
 parser.add_argument('--num_workers', type=int, default=16, help='number of workers.')
+parser.add_argument('--prompt_len', type=int, default=5, help='number of prompt components per prompt block.')
+parser.add_argument('--num_expert', type=int, default=1, help='top-k prompt experts used for sparse routing.')
+parser.add_argument('--use_cpr', type=int, default=0, help='set 1 to enable contrastive prompt regularization (CPR).')
+parser.add_argument('--neg_num', type=int, default=2, help='number of negative prompt samples per batch when CPR is enabled.')
+parser.add_argument('--lambda_cpr', type=float, default=0.1, help='weight of CPR loss term.')
+parser.add_argument('--cpr_margin', type=float, default=0.01, help='margin used by CPR ranking loss.')
+parser.add_argument('--use_tur', type=int, default=0, help='set 1 to enable task-uncertainty regularization (TUR).')
+parser.add_argument('--lambda_tur', type=float, default=0.05, help='weight of TUR loss term.')
+parser.add_argument('--tur_eps', type=float, default=1e-8, help='numerical epsilon for TUR entropy and normalization.')
 
 # path
 parser.add_argument('--data_file_dir', type=str, default='data_dir/',  help='where clean images of denoising saves.')

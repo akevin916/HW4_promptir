@@ -34,6 +34,15 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=3407, help="Random seed.")
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision training.")
     parser.add_argument("--save_every", type=int, default=20, help="Save periodic checkpoint every N epochs.")
+    parser.add_argument("--prompt_len", type=int, default=5, help="Number of prompt components per prompt block.")
+    parser.add_argument("--num_expert", type=int, default=1, help="Top-k prompt experts used for sparse routing.")
+    parser.add_argument("--use_cpr", action="store_true", help="Enable contrastive prompt regularization (CPR).")
+    parser.add_argument("--neg_num", type=int, default=2, help="Number of negative prompt samples per iteration when CPR is enabled.")
+    parser.add_argument("--lambda_cpr", type=float, default=0.1, help="Weight of CPR loss term.")
+    parser.add_argument("--cpr_margin", type=float, default=0.01, help="Margin used by CPR ranking loss.")
+    parser.add_argument("--use_tur", action="store_true", help="Enable task-uncertainty regularization (TUR) on prompt routing.")
+    parser.add_argument("--lambda_tur", type=float, default=0.05, help="Weight of TUR loss term.")
+    parser.add_argument("--tur_eps", type=float, default=1e-8, help="Numerical epsilon for TUR entropy and normalization.")
     parser.add_argument(
         "--resume",
         type=str,
@@ -89,12 +98,37 @@ def psnr_batch(restored: torch.Tensor, target: torch.Tensor) -> float:
     return psnr.mean().item()
 
 
+class UncertaintyEstimationHead(nn.Module):
+    def __init__(self, in_channels: int = 96):
+        super().__init__()
+        hidden = max(32, in_channels // 2)
+        self.body = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(hidden, hidden, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(hidden, 1, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return self.body(feat).flatten(1).squeeze(1)
+
+
+def compute_uncertainty_weighted_loss(
+    base_per_sample: torch.Tensor,
+    log_var: torch.Tensor,
+    reg_weight: float = 1.0,
+) -> torch.Tensor:
+    # TUR objective: 0.5 * exp(-s) * L + 0.5 * lambda * s, where s = log(sigma^2).
+    return (0.5 * torch.exp(-log_var) * base_per_sample + 0.5 * reg_weight * log_var).mean()
+
+
 def validate(model: nn.Module, dataloader: DataLoader, device: torch.device):
     model.eval()
     val_l1 = 0.0
     val_psnr = 0.0
     criterion = nn.L1Loss()
-
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validate", leave=False):
             degraded = batch["degraded"].to(device, non_blocking=True)
@@ -142,11 +176,21 @@ def main():
         pin_memory=True,
     )
 
-    model = PromptIR(decoder=True).to(device)
+    model = PromptIR(
+        decoder=True,
+        prompt_len=args.prompt_len,
+        num_expert=args.num_expert,
+    ).to(device)
+    uem_head = UncertaintyEstimationHead(in_channels=96).to(device)
     print("Training from scratch: pretrained weights are NOT used.")
 
     criterion = nn.L1Loss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    criterion_per_sample = nn.L1Loss(reduction="none")
+    if not args.use_tur:
+        for p in uem_head.parameters():
+            p.requires_grad = False
+    params = list(model.parameters()) + (list(uem_head.parameters()) if args.use_tur else [])
+    optimizer = optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
 
@@ -174,6 +218,8 @@ def main():
             scheduler.load_state_dict(ckpt["scheduler"])
         if "scaler" in ckpt and scaler is not None:
             scaler.load_state_dict(ckpt["scaler"])
+        if args.use_tur and "uem_head" in ckpt:
+            uem_head.load_state_dict(ckpt["uem_head"])
 
         best_psnr = ckpt.get("best_psnr", best_psnr)
         start_epoch = int(ckpt.get("epoch", 0)) + 1
@@ -191,6 +237,7 @@ def main():
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
+        uem_head.train()
         running_loss = 0.0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
@@ -200,15 +247,52 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(args.amp and device.type == "cuda")):
-                restored = model(degraded)
-                loss = criterion(restored, clean)
+                restored, aux = model(degraded, is_neg=False, return_aux=True)
+                rec_loss = criterion(restored, clean)
+                rec_per_sample = criterion_per_sample(restored, clean).mean(dim=(1, 2, 3))
+
+                if args.use_cpr:
+                    neg_losses = []
+                    with torch.no_grad():
+                        for _ in range(args.neg_num):
+                            neg_restored = model(degraded, is_neg=True)
+                            neg_losses.append(criterion(neg_restored, clean))
+
+                    neg_loss = torch.stack(neg_losses).mean() if len(neg_losses) > 0 else rec_loss.detach()
+                    cpr_loss = torch.relu(rec_loss + args.cpr_margin - neg_loss)
+                else:
+                    cpr_loss = torch.zeros_like(rec_loss)
+
+                base_per_sample = rec_per_sample + args.lambda_cpr * cpr_loss
+                base_loss = base_per_sample.mean()
+
+                if args.use_tur:
+                    tur_feature = aux.get("tur_feature", None)
+                    if tur_feature is None:
+                        raise RuntimeError("Missing TUR feature from model aux output.")
+                    log_var = uem_head(tur_feature)
+                    log_var = torch.clamp(log_var, min=-10.0, max=10.0)
+                    loss = compute_uncertainty_weighted_loss(base_per_sample, log_var, reg_weight=args.lambda_tur)
+                    tur_loss = loss - base_loss
+                    sigma = torch.exp(0.5 * log_var)
+                else:
+                    loss = base_loss
+                    tur_loss = torch.zeros_like(rec_loss)
+                    sigma = None
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             running_loss += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                rec=f"{rec_loss.item():.4f}",
+                cpr=f"{cpr_loss.item():.4f}",
+                tur=f"{tur_loss.item():.4f}",
+                sigma=(f"{sigma.mean().item():.3f}" if sigma is not None else "-"),
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            )
 
         scheduler.step()
         train_loss = running_loss / max(1, len(train_loader))
@@ -228,6 +312,8 @@ def main():
             "best_psnr": best_psnr,
             "args": vars(args),
         }
+        if args.use_tur:
+            state["uem_head"] = uem_head.state_dict()
 
         torch.save(state, last_path)
 
